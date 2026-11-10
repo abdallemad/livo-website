@@ -1,0 +1,390 @@
+// LIVO data model — derived from the designer prototype (see docs/backend.md).
+//
+// Conventions (CLAUDE.md §6): cuid ids except User (= Clerk user id), `slug @unique` on public
+// entities, `isActive` visibility flags, createdAt/updatedAt, enums for status machines, a `File`
+// table as the source of truth for every object stored in R2. Localised copy (EN/FR/DE) is a JSON
+// object `{ en, fr?, de? }` — the same `Localized` shape the UI already uses.
+//
+// Schema changes ship as idempotent SQL in prisma/sql/ (applied by scripts/prebuild-db.cjs).
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider  = "postgresql"
+  url       = env("DATABASE_URL")
+  directUrl = env("DIRECT_URL")
+  // every table lives in its own Postgres schema: the database also hosts an older marketplace
+  // schema in `public`, which this app must never touch
+  schemas   = ["livo"]
+}
+
+// ---------------------------------------------------------------- people
+
+enum Role {
+  CUSTOMER
+  PRO
+  ADMIN
+
+  @@schema("livo")
+}
+
+/// How the person wants to be reached (profile pills, booking chat).
+enum ContactMethod {
+  WHATSAPP
+  PHONE
+  EMAIL
+
+  @@schema("livo")
+}
+
+model User {
+  /// Clerk user id — never generated here.
+  id               String         @id
+  email            String?        @unique
+  firstName        String?
+  lastName         String?
+  phone            String?
+  role             Role           @default(CUSTOMER)
+  locale           String         @default("en")
+  contactMethod    ContactMethod?
+  addressBuilding  String?
+  addressStreet    String?
+  addressPostcode  String?
+  city             String?
+  /// profile photo uploaded on the account page (Clerk's own image is the fallback)
+  photoId          String?        @unique
+  photo            File?          @relation("UserPhoto", fields: [photoId], references: [id], onDelete: SetNull)
+  createdAt        DateTime       @default(now())
+  updatedAt        DateTime       @updatedAt
+
+  bookings         Booking[]         @relation("BookingCustomer")
+  /// bookings this professional was assigned to by an admin
+  assignedBookings Booking[]         @relation("BookingProvider")
+  providerRequests ProviderRequest[]
+  reviews          Review[]
+  contactMessages  ContactMessage[]
+
+  @@schema("livo")
+}
+
+// ---------------------------------------------------------------- storage
+
+enum FileKind {
+  /// site artwork copied from public/img (logos, slides, service images)
+  STATIC
+  AVATAR
+  BOOKING_PHOTO
+  REVIEW_PHOTO
+  PROVIDER_DOCUMENT
+  CONTACT_ATTACHMENT
+
+  @@schema("livo")
+}
+
+model File {
+  id         String   @id @default(cuid())
+  /// object key in the R2 bucket, e.g. "static/img/icons/plumbing.webp"
+  key        String   @unique
+  kind       FileKind
+  mimeType   String
+  size       Int
+  sha256     String
+  /// original file name (uploads) or public path (static, e.g. "/img/logo.png")
+  name       String?
+  width      Int?
+  height     Int?
+  createdAt  DateTime @default(now())
+
+  avatarOf          User?                @relation("UserPhoto")
+  categoryBanner    ServiceCategory?     @relation("CategoryBanner")
+  serviceIcon       Service?             @relation("ServiceIcon")
+  serviceImage      Service?             @relation("ServiceImage")
+  slideDesktop      HeroSlide?           @relation("SlideDesktop")
+  slideMobile       HeroSlide?           @relation("SlideMobile")
+  bookingId         String?
+  booking           Booking?             @relation(fields: [bookingId], references: [id], onDelete: Cascade)
+  reviewId          String?
+  review            Review?              @relation(fields: [reviewId], references: [id], onDelete: Cascade)
+  providerRequestId String?
+  providerRequest   ProviderRequest?     @relation(fields: [providerRequestId], references: [id], onDelete: Cascade)
+  /// which document of the provider request ("cv", "id_front", "licence_back"…)
+  documentType      String?
+  contactMessageId  String?
+  contactMessage    ContactMessage?      @relation(fields: [contactMessageId], references: [id], onDelete: Cascade)
+
+  @@index([kind])
+  @@index([bookingId])
+  @@index([reviewId])
+  @@index([providerRequestId])
+  @@index([contactMessageId])
+
+  @@schema("livo")
+}
+
+// ---------------------------------------------------------------- catalogue
+
+model ServiceCategory {
+  id         String    @id @default(cuid())
+  /// "repairs", "renovation", "cleaning-garden"… (URL anchors on /services)
+  slug       String    @unique
+  emoji      String
+  /// { en, fr, de }
+  name       Json
+  /// banner gradient [from, to]
+  colorFrom  String
+  colorTo    String
+  bannerId   String?   @unique
+  banner     File?     @relation("CategoryBanner", fields: [bannerId], references: [id], onDelete: SetNull)
+  sortOrder  Int       @default(0)
+  isActive   Boolean   @default(true)
+  createdAt  DateTime  @default(now())
+  updatedAt  DateTime  @updatedAt
+
+  services   Service[]
+
+  @@schema("livo")
+}
+
+model Service {
+  id           String          @id @default(cuid())
+  /// "plumbing", "cleaning"… (chat presets, /services#plumbing, review links)
+  slug         String          @unique
+  categoryId   String
+  category     ServiceCategory @relation(fields: [categoryId], references: [id], onDelete: Restrict)
+  emoji        String
+  /// { en, fr, de }
+  name         Json
+  /// { en, fr, de }
+  description  Json
+  /// { en: string[], fr?: string[], de?: string[] }
+  subServices  Json
+  /// shown in the home page's service cards
+  featured     Boolean         @default(false)
+  /// position among the home page cards (0 = first)
+  featuredOrder Int            @default(0)
+  iconId       String?         @unique
+  icon         File?           @relation("ServiceIcon", fields: [iconId], references: [id], onDelete: SetNull)
+  imageId      String?         @unique
+  image        File?           @relation("ServiceImage", fields: [imageId], references: [id], onDelete: SetNull)
+  sortOrder    Int             @default(0)
+  isActive     Boolean         @default(true)
+  createdAt    DateTime        @default(now())
+  updatedAt    DateTime        @updatedAt
+
+  bookings      Booking[]
+  providerRequests ProviderRequest[]
+  reviews       Review[]
+  contactMessages ContactMessage[]
+
+  @@index([categoryId])
+
+  @@schema("livo")
+}
+
+/// Home page hero slider. Copy is localised JSON, the call-to-action buttons are `actions`.
+model HeroSlide {
+  id          String   @id @default(cuid())
+  key         String   @unique
+  /// whole slide content as the UI consumes it (tag, title words, text, actions)
+  content     Json
+  desktopId   String?  @unique
+  desktop     File?    @relation("SlideDesktop", fields: [desktopId], references: [id], onDelete: SetNull)
+  mobileId    String?  @unique
+  mobile      File?    @relation("SlideMobile", fields: [mobileId], references: [id], onDelete: SetNull)
+  sortOrder   Int      @default(0)
+  isActive    Boolean  @default(true)
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  @@schema("livo")
+}
+
+/// Luxembourg towns suggested in the booking chat's address step.
+model Town {
+  id         String  @id @default(cuid())
+  name       String  @unique
+  sortOrder  Int     @default(0)
+  isActive   Boolean @default(true)
+
+  @@schema("livo")
+}
+
+// ---------------------------------------------------------------- bookings
+
+/// Booking lifecycle. A booking exists only once the customer confirmed it in the chat/app.
+enum BookingStatus {
+  RECEIVED
+  MATCHED
+  SCHEDULED
+  DONE
+  CANCELLED
+
+  @@schema("livo")
+}
+
+/// A booking made in the booking chat (web) or the mobile app — created only after the
+/// customer confirmed the summary.
+model Booking {
+  id             String         @id @default(cuid())
+  /// public reference shown to the customer, e.g. "LV-4821"
+  ref            String         @unique
+  userId         String?
+  user           User?          @relation("BookingCustomer", fields: [userId], references: [id], onDelete: SetNull)
+  serviceId      String?
+  service        Service?       @relation(fields: [serviceId], references: [id], onDelete: SetNull)
+  /// professional assigned by an admin (status MATCHED and later)
+  providerId     String?
+  provider       User?          @relation("BookingProvider", fields: [providerId], references: [id], onDelete: SetNull)
+  /// internal note, admins only
+  adminNote      String?
+  /// free text when the visitor described the job instead of picking a service
+  customService  String?
+  /// "YYYY-MM-DD", or null with `asap`
+  date           String?
+  asap           Boolean        @default(false)
+  /// time slot as chosen in the chat ("Morning", "14:00"…)
+  time           String?
+  name           String
+  address        String
+  phone          String
+  contactMethod  ContactMethod?
+  email          String?
+  locale         String         @default("en")
+  status         BookingStatus  @default(RECEIVED)
+  /// when the customer pressed "Confirm" (the row is created at that moment)
+  confirmedAt    DateTime       @default(now())
+  createdAt      DateTime       @default(now())
+  updatedAt      DateTime       @updatedAt
+
+  photos         File[]
+  reviews        Review[]
+
+  @@index([userId, createdAt])
+  @@index([email])
+  @@index([status])
+  @@index([providerId])
+
+  @@schema("livo")
+}
+
+/// Rating left after a completed booking (/review?service=…&ref=…).
+model Review {
+  id          String          @id @default(cuid())
+  userId      String?
+  user        User?           @relation(fields: [userId], references: [id], onDelete: SetNull)
+  bookingId   String?
+  booking     Booking?        @relation(fields: [bookingId], references: [id], onDelete: SetNull)
+  /// booking reference as linked (?ref=LV-1234), kept even when no booking matches
+  bookingRef  String?
+  serviceId   String?
+  service     Service?        @relation(fields: [serviceId], references: [id], onDelete: SetNull)
+  /// overall stars, 1–5
+  rating      Int
+  /// per-aspect stars, e.g. { "quality": 5, "punctuality": 4 }
+  details     Json?
+  /// "would you recommend LIVO" answer as given by the form
+  recommend   String?
+  tags        String[]
+  comment     String?
+  /// the customer agreed to show it publicly
+  publish     Boolean         @default(false)
+  isApproved  Boolean         @default(false)
+  locale      String          @default("en")
+  createdAt   DateTime        @default(now())
+
+  photos      File[]
+
+  @@index([serviceId, isApproved])
+
+  @@schema("livo")
+}
+
+// ---------------------------------------------------------------- professionals
+
+/// Review of a "become a provider" request.
+enum ProviderRequestStatus {
+  RECEIVED
+  IN_REVIEW
+  APPROVED
+  REJECTED
+
+  @@schema("livo")
+}
+
+/// "Become a provider" request — sent from the join page ("Work with LIVO") or the professional
+/// sign-up, by a guest or a signed-in user, with the person's details and documents.
+model ProviderRequest {
+  id               String            @id @default(cuid())
+  userId           String?
+  user             User?             @relation(fields: [userId], references: [id], onDelete: SetNull)
+  firstName        String
+  lastName         String
+  phone            String
+  email            String?
+  serviceId        String?
+  service          Service?          @relation(fields: [serviceId], references: [id], onDelete: SetNull)
+  addressBuilding  String?
+  addressStreet    String?
+  addressPostcode  String?
+  city             String?
+  /// ISO 639 codes of the languages the pro speaks
+  languages        String[]
+  experience       String?
+  about            String?
+  hasCar           Boolean?
+  idType           String?
+  licenceType      String?
+  /// work authorisation (non-EU)
+  authorized       Boolean?
+  locale           String            @default("en")
+  status           ProviderRequestStatus @default(RECEIVED)
+  /// internal note, admins only
+  adminNote        String?
+  /// when an admin approved or rejected it
+  reviewedAt       DateTime?
+  createdAt        DateTime          @default(now())
+  updatedAt        DateTime          @updatedAt
+
+  documents        File[]
+
+  @@index([status])
+  @@index([userId])
+
+  @@schema("livo")
+}
+
+// ---------------------------------------------------------------- contact
+
+enum ContactTopic {
+  GENERAL
+  INQUIRY
+  COMPLAINT
+
+  @@schema("livo")
+}
+
+model ContactMessage {
+  id         String       @id @default(cuid())
+  topic      ContactTopic @default(GENERAL)
+  userId     String?
+  user       User?        @relation(fields: [userId], references: [id], onDelete: SetNull)
+  name       String
+  email      String
+  phone      String?
+  serviceId  String?
+  service    Service?     @relation(fields: [serviceId], references: [id], onDelete: SetNull)
+  /// booking reference for complaints
+  reference  String?
+  message    String
+  locale     String       @default("en")
+  isHandled  Boolean      @default(false)
+  createdAt  DateTime     @default(now())
+
+  attachments File[]
+
+  @@index([topic, isHandled])
+
+  @@schema("livo")
+}
